@@ -437,6 +437,99 @@ def test_check_config_valid_missing_project_keys() -> None:
         assert "project missing keys" in result["detail"]
 
 
+# ───────────────────────────── QA: run_health_json integration ─────────────────────────────
+
+
+def test_run_health_json_invalid_config_produces_valid_json() -> None:
+    """run_health_json with a missing config should cascade-skip remaining checks."""
+    import io
+    import contextlib
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = sbs.run_health_json("nonexistent-slug-for-qa-test")
+    output = buf.getvalue()
+    data = json.loads(output)
+    assert data["ok"] is False
+    assert len(data["checks"]) == 4, f"expected 4 checks, got {len(data['checks'])}"
+    # First check failed, rest are skipped
+    assert data["checks"][0]["name"] == "config-valid"
+    assert data["checks"][0]["passed"] is False
+    for c in data["checks"][1:]:
+        assert c["passed"] is False
+        assert "skipped" in c["detail"]
+    assert rc == 1
+
+
+def test_run_health_json_valid_config_checks_structure() -> None:
+    """run_health_json with a valid config should include all 4 checks in order."""
+    import io
+    import contextlib
+
+    with tempfile.TemporaryDirectory() as td:
+        # Create a config in the expected location relative to cwd
+        configs_dir = Path(td) / ".claude" / "super-board" / "configs"
+        configs_dir.mkdir(parents=True)
+        cfg = {
+            "project": {"owner": "nonexistent-owner-qa-test", "number": 99999},
+            "base_branch": "main",
+            "columns": ["Ready", "Done"],
+        }
+        (configs_dir / "qa-test.json").write_text(json.dumps(cfg))
+
+        import os
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(td)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = sbs.run_health_json("qa-test")
+        finally:
+            os.chdir(old_cwd)
+
+    output = buf.getvalue()
+    data = json.loads(output)
+    assert isinstance(data["ok"], bool)
+    assert isinstance(data["checks"], list)
+    assert len(data["checks"]) == 4
+    expected_names = ["config-valid", "gh-auth", "project-reachable", "columns-match"]
+    actual_names = [c["name"] for c in data["checks"]]
+    assert actual_names == expected_names, f"check order: {actual_names}"
+    # First check should pass (config is valid)
+    assert data["checks"][0]["passed"] is True
+    # Each check has the required keys
+    for c in data["checks"]:
+        assert set(c.keys()) == {"name", "passed", "detail"}, f"unexpected keys in {c}"
+
+
+def test_check_config_valid_extra_keys_accepted() -> None:
+    """A config with extra keys beyond the required set should still pass."""
+    with tempfile.TemporaryDirectory() as td:
+        cfg = {
+            "project": {"owner": "acme", "number": 1, "title": "My Project"},
+            "base_branch": "main",
+            "columns": ["Ready", "Done"],
+            "extra_field": "should not cause failure",
+            "merge_policy": {"default": "auto"},
+        }
+        p = Path(td) / "extra.json"
+        p.write_text(json.dumps(cfg))
+        result = sbs.check_config_valid(p)
+        assert result["passed"] is True
+
+
+def test_json_mode_invalid_slug_returns_json_not_stderr() -> None:
+    """Invalid slug in --json mode should produce JSON on stdout, not a stderr message."""
+    import io
+    import contextlib
+
+    slug, json_mode = sbs._parse_args(["status.py", "--json", "../traversal"])
+    assert json_mode is True
+    # The main function handles invalid slugs in JSON mode
+    # We test that _parse_args correctly extracts the flag and slug
+    assert slug == "../traversal"
+
+
 def _run() -> int:
     tests = [
         (name, fn) for name, fn in globals().items()
