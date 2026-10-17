@@ -316,8 +316,8 @@ def reason_for(body: str) -> tuple[str, str]:
 
 def field_status(node: dict[str, Any]) -> str:
     """Read the `Status` single-select field from a project-item node."""
-    for fv in (node.get("fieldValues", {}).get("nodes") or []):
-        if fv and fv.get("field", {}).get("name") == "Status":
+    for fv in ((node.get("fieldValues") or {}).get("nodes") or []):
+        if fv and (fv.get("field") or {}).get("name") == "Status":
             return fv.get("name") or "Backlog"
     return "Backlog"
 
@@ -530,7 +530,7 @@ def check_config_valid(config_path: Path) -> dict[str, Any]:
     missing = [k for k in ("project", "base_branch", "columns") if k not in cfg]
     if missing:
         return {"name": name, "passed": False, "detail": f"missing keys: {', '.join(missing)}"}
-    proj = cfg.get("project", {})
+    proj = cfg.get("project") or {}
     proj_missing = [k for k in ("owner", "number") if k not in proj]
     if proj_missing:
         return {"name": name, "passed": False, "detail": f"project missing keys: {', '.join(proj_missing)}"}
@@ -725,7 +725,7 @@ def main() -> int:
     cfg = json.loads(config_path.read_text())
     project_owner: str = cfg["project"]["owner"]
     project_number: int = int(cfg["project"]["number"])
-    runs_dir = cfg.get("paths", {}).get("runs_dir", "docs/super-board/runs")
+    runs_dir = (cfg.get("paths") or {}).get("runs_dir", "docs/super-board/runs")
     run_date = datetime.date.today().isoformat()
     manifest_path = Path(runs_dir) / f"{run_date}-{config_slug}.md"
 
@@ -767,7 +767,7 @@ def main() -> int:
             "title": sanitize_title(c.get("title") or ""),
             "labels": [
                 l["name"]
-                for l in (c.get("labels", {}).get("nodes") or [])
+                for l in ((c.get("labels") or {}).get("nodes") or [])
                 if l.get("name")
             ],
             "status": field_status(n),
@@ -857,8 +857,8 @@ def main() -> int:
     tt = cfg.get("truth_threshold", 70)
     gate_label = {"off": "off", "always": "always"}.get(tg, f"non-trivial (≥{tt})")
     bot_login = (
-        cfg.get("notifications", {}).get("bot_identity")
-        or cfg.get("claim", {}).get("assignee_login")
+        (cfg.get("notifications") or {}).get("bot_identity")
+        or (cfg.get("claim") or {}).get("assignee_login")
         or "?"
     )
     max_workers = cfg.get("max_workers", 3)
