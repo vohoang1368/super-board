@@ -630,8 +630,9 @@ def check_columns_match(owner: str, number: int, expected: list[str]) -> dict[st
         return {"name": name, "passed": False, "detail": "invalid JSON response"}
     # Find the Status field
     fields = (
-        ((data.get("data") or {}).get("repositoryOwner") or {})
-        .get("projectV2", {}).get("fields", {}).get("nodes") or []
+        ((((data.get("data") or {}).get("repositoryOwner") or {})
+          .get("projectV2") or {}).get("fields") or {})
+        .get("nodes") or []
     )
     status_field = None
     for f in fields:
