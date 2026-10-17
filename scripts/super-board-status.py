@@ -28,9 +28,18 @@ Windows (PowerShell / CMD / Git Bash / WSL). No bash, no jq.
 
 Usage:
   python .claude/bin/super-board-status.py [<config-slug>]
+  python .claude/bin/super-board-status.py --json [<config-slug>]
+
+Flags:
+  --json   Run health checks and print a JSON report to stdout.
+           JSON contains ``ok`` (boolean) and ``checks`` (array of
+           ``{name, passed, detail}``).  Checks: config-valid,
+           gh-auth, project-reachable, columns-match.
+           Exit 0 when all pass, exit 1 when any fails.
 
 Exit codes:
-  0  ok
+  0  ok (or all health checks pass in --json mode)
+  1  one or more health checks failed (--json mode only)
   64 missing arg + no active marker + no single config
   66 config not found
   67 gh / network failure
@@ -307,8 +316,8 @@ def reason_for(body: str) -> tuple[str, str]:
 
 def field_status(node: dict[str, Any]) -> str:
     """Read the `Status` single-select field from a project-item node."""
-    for fv in (node.get("fieldValues", {}).get("nodes") or []):
-        if fv and fv.get("field", {}).get("name") == "Status":
+    for fv in ((node.get("fieldValues") or {}).get("nodes") or []):
+        if fv and (fv.get("field") or {}).get("name") == "Status":
             return fv.get("name") or "Backlog"
     return "Backlog"
 
@@ -494,15 +503,220 @@ def render_kanban(
     return "\n".join(boxes)
 
 
+def _parse_args(argv: list[str]) -> tuple[str, bool]:
+    """Parse argv into (config_slug, json_mode).
+
+    Strips ``--json`` from the argument list before slug resolution so
+    ``super-board-status.py --json <slug>`` and
+    ``super-board-status.py <slug> --json`` both work.
+    """
+    json_mode = "--json" in argv[1:]
+    filtered = [argv[0]] + [a for a in argv[1:] if a != "--json"]
+    slug = resolve_config_slug(filtered)
+    return slug, json_mode
+
+
+# ───────────────────────────── health checks ─────────────────────────────
+
+def check_config_valid(config_path: Path) -> dict[str, Any]:
+    """Check that the config file exists and contains required keys."""
+    name = "config-valid"
+    if not config_path.is_file():
+        return {"name": name, "passed": False, "detail": f"{config_path} not found"}
+    try:
+        cfg = json.loads(config_path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        return {"name": name, "passed": False, "detail": f"parse error: {exc}"}
+    missing = [k for k in ("project", "base_branch", "columns") if k not in cfg]
+    if missing:
+        return {"name": name, "passed": False, "detail": f"missing keys: {', '.join(missing)}"}
+    proj = cfg.get("project") or {}
+    proj_missing = [k for k in ("owner", "number") if k not in proj]
+    if proj_missing:
+        return {"name": name, "passed": False, "detail": f"project missing keys: {', '.join(proj_missing)}"}
+    return {"name": name, "passed": True, "detail": "config loaded"}
+
+
+def check_gh_auth() -> dict[str, Any]:
+    """Check that ``gh auth status`` succeeds."""
+    name = "gh-auth"
+    try:
+        proc = subprocess.run(
+            ["gh", "auth", "status"],
+            capture_output=True, text=True, encoding="utf-8", check=False,
+        )
+    except FileNotFoundError:
+        return {"name": name, "passed": False, "detail": "gh CLI not found on PATH"}
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or "unknown error").strip().splitlines()
+        return {"name": name, "passed": False, "detail": msg[0] if msg else "auth failed"}
+    return {"name": name, "passed": True, "detail": "authenticated"}
+
+
+def check_project_reachable(owner: str, number: int) -> dict[str, Any]:
+    """Check that the GitHub project is reachable via GraphQL."""
+    name = "project-reachable"
+    query = """
+    query($owner:String!, $number:Int!) {
+      repositoryOwner(login:$owner) {
+        ... on ProjectV2Owner {
+          projectV2(number:$number) { title }
+        }
+      }
+    }
+    """
+    try:
+        proc = subprocess.run(
+            ["gh", "api", "graphql",
+             "-f", f"query={query}",
+             "-F", f"owner={owner}",
+             "-F", f"number={number}"],
+            capture_output=True, text=True, encoding="utf-8", check=False,
+        )
+    except FileNotFoundError:
+        return {"name": name, "passed": False, "detail": "gh CLI not found on PATH"}
+    if proc.returncode != 0:
+        msg = (proc.stderr or "").strip().splitlines()
+        return {"name": name, "passed": False, "detail": msg[0] if msg else "graphql call failed"}
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {"name": name, "passed": False, "detail": "invalid JSON response"}
+    if data.get("errors"):
+        return {"name": name, "passed": False, "detail": data["errors"][0].get("message", "graphql error")}
+    project = ((data.get("data") or {}).get("repositoryOwner") or {}).get("projectV2")
+    if not project:
+        return {"name": name, "passed": False, "detail": f"project #{number} not found for {owner}"}
+    return {"name": name, "passed": True, "detail": f"project '{project.get('title', '?')}' reachable"}
+
+
+def check_columns_match(owner: str, number: int, expected: list[str]) -> dict[str, Any]:
+    """Check that the project's Status field options match the config's columns."""
+    name = "columns-match"
+    query = """
+    query($owner:String!, $number:Int!) {
+      repositoryOwner(login:$owner) {
+        ... on ProjectV2Owner {
+          projectV2(number:$number) {
+            fields(first:30) {
+              nodes {
+                ... on ProjectV2SingleSelectField {
+                  name
+                  options { name }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    try:
+        proc = subprocess.run(
+            ["gh", "api", "graphql",
+             "-f", f"query={query}",
+             "-F", f"owner={owner}",
+             "-F", f"number={number}"],
+            capture_output=True, text=True, encoding="utf-8", check=False,
+        )
+    except FileNotFoundError:
+        return {"name": name, "passed": False, "detail": "gh CLI not found on PATH"}
+    if proc.returncode != 0:
+        msg = (proc.stderr or "").strip().splitlines()
+        return {"name": name, "passed": False, "detail": msg[0] if msg else "graphql call failed"}
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {"name": name, "passed": False, "detail": "invalid JSON response"}
+    # Find the Status field
+    fields = (
+        ((((data.get("data") or {}).get("repositoryOwner") or {})
+          .get("projectV2") or {}).get("fields") or {})
+        .get("nodes") or []
+    )
+    status_field = None
+    for f in fields:
+        if f and f.get("name") == "Status":
+            status_field = f
+            break
+    if not status_field:
+        return {"name": name, "passed": False, "detail": "no Status field found on project"}
+    actual = sorted(o["name"] for o in (status_field.get("options") or []) if o.get("name"))
+    expected_sorted = sorted(expected)
+    if actual != expected_sorted:
+        missing = sorted(set(expected_sorted) - set(actual))
+        extra = sorted(set(actual) - set(expected_sorted))
+        parts: list[str] = []
+        if missing:
+            parts.append(f"missing: {', '.join(missing)}")
+        if extra:
+            parts.append(f"extra: {', '.join(extra)}")
+        return {"name": name, "passed": False, "detail": "; ".join(parts)}
+    return {"name": name, "passed": True, "detail": f"{len(actual)} columns match"}
+
+
+def run_health_json(config_slug: str) -> int:
+    """Run health checks and print a JSON report to stdout.
+
+    Returns 0 when all checks pass, 1 when any fails.
+    """
+    config_path = Path(f".claude/super-board/configs/{config_slug}.json")
+
+    checks: list[dict[str, Any]] = []
+
+    # 1. config-valid
+    cfg_check = check_config_valid(config_path)
+    checks.append(cfg_check)
+
+    if not cfg_check["passed"]:
+        # Cannot proceed with remaining checks without a valid config
+        checks.append({"name": "gh-auth", "passed": False, "detail": "skipped: config invalid"})
+        checks.append({"name": "project-reachable", "passed": False, "detail": "skipped: config invalid"})
+        checks.append({"name": "columns-match", "passed": False, "detail": "skipped: config invalid"})
+        result = {"ok": False, "checks": checks}
+        print(json.dumps(result, indent=2))
+        return 1
+
+    cfg = json.loads(config_path.read_text())
+    owner: str = cfg["project"]["owner"]
+    number: int = int(cfg["project"]["number"])
+    columns: list[str] = cfg.get("columns", [])
+
+    # 2. gh-auth
+    checks.append(check_gh_auth())
+
+    # 3. project-reachable
+    checks.append(check_project_reachable(owner, number))
+
+    # 4. columns-match
+    checks.append(check_columns_match(owner, number, columns))
+
+    ok = all(c["passed"] for c in checks)
+    result = {"ok": ok, "checks": checks}
+    print(json.dumps(result, indent=2))
+    return 0 if ok else 1
+
+
 def main() -> int:
-    config_slug = resolve_config_slug(sys.argv)
+    config_slug, json_mode = _parse_args(sys.argv)
     if not valid_slug(config_slug):
+        if json_mode:
+            result = {"ok": False, "checks": [
+                {"name": "config-valid", "passed": False,
+                 "detail": f"invalid slug: {config_slug!r}"},
+            ]}
+            print(json.dumps(result, indent=2))
+            return 1
         print(
             f"invalid config slug: {config_slug!r} "
             f"(allowed chars: letters, digits, '.', '_', '-')",
             file=sys.stderr,
         )
         return 64
+
+    if json_mode:
+        return run_health_json(config_slug)
+
     config_path = Path(f".claude/super-board/configs/{config_slug}.json")
     if not config_path.is_file():
         print(f"config not found: {config_path}", file=sys.stderr)
@@ -511,7 +725,7 @@ def main() -> int:
     cfg = json.loads(config_path.read_text())
     project_owner: str = cfg["project"]["owner"]
     project_number: int = int(cfg["project"]["number"])
-    runs_dir = cfg.get("paths", {}).get("runs_dir", "docs/super-board/runs")
+    runs_dir = (cfg.get("paths") or {}).get("runs_dir", "docs/super-board/runs")
     run_date = datetime.date.today().isoformat()
     manifest_path = Path(runs_dir) / f"{run_date}-{config_slug}.md"
 
@@ -553,7 +767,7 @@ def main() -> int:
             "title": sanitize_title(c.get("title") or ""),
             "labels": [
                 l["name"]
-                for l in (c.get("labels", {}).get("nodes") or [])
+                for l in ((c.get("labels") or {}).get("nodes") or [])
                 if l.get("name")
             ],
             "status": field_status(n),
@@ -643,8 +857,8 @@ def main() -> int:
     tt = cfg.get("truth_threshold", 70)
     gate_label = {"off": "off", "always": "always"}.get(tg, f"non-trivial (≥{tt})")
     bot_login = (
-        cfg.get("notifications", {}).get("bot_identity")
-        or cfg.get("claim", {}).get("assignee_login")
+        (cfg.get("notifications") or {}).get("bot_identity")
+        or (cfg.get("claim") or {}).get("assignee_login")
         or "?"
     )
     max_workers = cfg.get("max_workers", 3)
